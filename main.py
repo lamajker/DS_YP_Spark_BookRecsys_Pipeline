@@ -59,7 +59,7 @@ def create_spark_session(master="local[*]", app_name="BookRecsysPipeline"):
         .config("spark.executor.cores", "2")
         .config("spark.executor.instances", "2")
         .config("spark.driver.cores", "4")
-        .config("spark.driver.memory", "4g")
+        .config("spark.driver.memory", "8g")  # 8 гигов по ТЗ
         .config("spark.sql.shuffle.partitions", "32")
         .config("spark.network.timeout", "300")
         # отключаем broadcast join, чтобы драйвер не падал по памяти при джойнах
@@ -167,6 +167,11 @@ def clean_auditions(df, verbose=False):
 
 # чистим контент: пропуски и нули в длительности заменяем медианой нормальных книг
 def clean_contents(df, verbose=False):
+    null_or_zero_count = df.filter(
+        F.col("main_content_duration_hours").isNull()
+        | (F.col("main_content_duration_hours") <= 0)
+    ).count()
+
     median_duration = df.filter(
         F.col("main_content_duration_hours") > 0
     ).approxQuantile("main_content_duration_hours", [0.5], 0.01)[0]
@@ -179,7 +184,11 @@ def clean_contents(df, verbose=False):
     ).fillna({"main_content_duration_hours": median_duration})
 
     if verbose:
-        logger.info("content: медианная длительность книги = %.7f ч", median_duration)
+        logger.info(
+            "content: заменено %d аномальных длительностей на медиану = %.7f ч",
+            null_or_zero_count,
+            median_duration,
+        )
 
     return df_cleaned
 
@@ -198,7 +207,7 @@ def join_and_parse_topics(aud_df, con_df, verbose=False):
     )
 
     if verbose:
-        logger.info("Джойн audition и content выполнен успешно")
+        logger.info("Джойн audition и content выполнен: %d строк", joined.count())
 
     return joined
 
@@ -221,10 +230,17 @@ def filter_dataset(df, start_date=None, end_date=None, geo_id=None):
 
 # вспомогательная функция: ищем топовую категорию юзера (любимый жанр, платформа или тип контента)
 def get_user_favorite_dimension(df, dimension_col, output_alias):
-    w = Window.partitionBy("puid").orderBy(F.desc("total_hours_dim"))
+    w = Window.partitionBy("puid").orderBy(
+        F.desc("total_hours_dim"),
+        F.desc("sessions_count"),
+        F.asc(dimension_col),
+    )
     return (
         df.groupBy("puid", dimension_col)
-        .agg(F.sum("hours").alias("total_hours_dim"))
+        .agg(
+            F.sum("hours").alias("total_hours_dim"),
+            F.count("*").alias("sessions_count"),
+        )
         .withColumn("rank", F.row_number().over(w))
         .filter(F.col("rank") == 1)
         .select("puid", F.col(dimension_col).alias(output_alias))
@@ -286,7 +302,11 @@ def build_user_genre_mart(df, user_content_mart):
         )
     )
 
-    w_genre = Window.partitionBy("puid").orderBy(F.desc("total_hours"))
+    w_genre = Window.partitionBy("puid").orderBy(
+        F.desc("total_hours"),
+        F.desc("sessions_count"),
+        F.asc("genre"),
+    )
 
     return (
         exploded.groupBy("puid", "genre")
@@ -347,9 +367,17 @@ def build_user_mart(df, user_content_mart, user_genre_mart):
         F.avg("finished_percent").alias("completion_rate")
     )
 
-    # любимый жанр берем с рангом 1
-    fav_genre = user_genre_mart.filter(F.col("genre_rank") == 1).select(
-        "puid", F.col("genre").alias("favorite_genre")
+    # любимый жанр: содержательный жанр (не 'Аудио') с минимальным рангом, если других жанров у пользователя нет, берем 'Аудио' как запасной вариант (фолбэк)
+    w_fav_genre = Window.partitionBy("puid").orderBy(
+        F.when(F.col("genre") != "Аудио", 0).otherwise(1),
+        F.col("genre_rank"),
+    )
+    fav_genre = (
+        user_genre_mart.withColumn(
+            "fav_priority_rank", F.row_number().over(w_fav_genre)
+        )
+        .filter(F.col("fav_priority_rank") == 1)
+        .select("puid", F.col("genre").alias("favorite_genre"))
     )
 
     fav_content_type = get_user_favorite_dimension(
@@ -485,7 +513,7 @@ def show_analytics(df):
     (
         df.groupBy("main_content_type")
         .agg(F.countDistinct("puid").alias("users"), F.count("*").alias("sessions"))
-        .orderBy(F.desc("sessions"))
+        .orderBy(F.desc("users"), F.desc("sessions"))
         .show(truncate=False)
     )
 
@@ -502,15 +530,16 @@ def show_analytics(df):
         .show(truncate=False)
     )
 
-    print("--- Топ регионов по числу сессий ---")
+    print("--- Топ регионов по числу пользователей ---")
     (
         df.filter(F.col("usage_geo_id").isNotNull())
         .groupBy("usage_geo_id")
         .agg(
+            F.countDistinct("puid").alias("users"),
             F.count("*").alias("sessions"),
             F.round(F.avg("hours"), 4).alias("avg_hours"),
         )
-        .orderBy(F.desc("sessions"))
+        .orderBy(F.desc("users"), F.desc("sessions"))
         .show(15, truncate=False)
     )
 
@@ -518,7 +547,7 @@ def show_analytics(df):
 # распределения по произвольным колонкам из флага --columns
 def show_column_distributions(df, columns):
     for col_name in columns:
-        print(f"\n--- Распределение: {col_name} (топ-20) ---")
+        print(f"\n--- Распределение: {col_name} (топ-20 по пользователям) ---")
         if col_name == "genre":
             (
                 df.select(
@@ -530,7 +559,7 @@ def show_column_distributions(df, columns):
                     F.countDistinct("puid").alias("users"),
                     F.count("*").alias("sessions"),
                 )
-                .orderBy(F.desc("sessions"))
+                .orderBy(F.desc("users"), F.desc("sessions"))
                 .show(20, truncate=False)
             )
         elif col_name in df.columns:
@@ -541,7 +570,7 @@ def show_column_distributions(df, columns):
                     F.countDistinct("puid").alias("users"),
                     F.count("*").alias("sessions"),
                 )
-                .orderBy(F.desc("sessions"))
+                .orderBy(F.desc("users"), F.desc("sessions"))
                 .show(20, truncate=False)
             )
         else:
@@ -568,6 +597,45 @@ def main():
                 raw_content.count(),
                 len(raw_content.columns),
             )
+            print("\n--- Схема audition ---")
+            raw_audition.printSchema()
+            print("\n--- Пример строк: audition (первые 5) ---")
+            raw_audition.show(5, truncate=False)
+
+            print("\n--- Схема content ---")
+            raw_content.printSchema()
+            print("\n--- Пример строк: content (первые 5) ---")
+            raw_content.show(5, truncate=False)
+
+            aud_nulls = (
+                raw_audition.select(
+                    [
+                        F.count(F.when(F.col(c).isNull(), c)).alias(c)
+                        for c in raw_audition.columns
+                    ]
+                )
+                .collect()[0]
+                .asDict()
+            )
+            logger.info(
+                "audition: пропуски по колонкам: %s",
+                {k: v for k, v in aud_nulls.items() if v > 0},
+            )
+
+            con_nulls = (
+                raw_content.select(
+                    [
+                        F.count(F.when(F.col(c).isNull(), c)).alias(c)
+                        for c in raw_content.columns
+                    ]
+                )
+                .collect()[0]
+                .asDict()
+            )
+            logger.info(
+                "content: пропуски по колонкам: %s",
+                {k: v for k, v in con_nulls.items() if v > 0},
+            )
 
         # очистка
         clean_aud = clean_auditions(raw_audition, verbose=args.verbose)
@@ -575,6 +643,18 @@ def main():
 
         # джойн
         joined_df = join_and_parse_topics(clean_aud, clean_con, verbose=args.verbose)
+
+        if args.verbose:
+            dup_sessions = (
+                joined_df.groupBy("audition_id")
+                .count()
+                .filter(F.col("count") > 1)
+                .count()
+            )
+            logger.info(
+                "Проверка дубликатов после джойна: дубликатов по audition_id = %d",
+                dup_sessions,
+            )
 
         # фильтрация если переданы параметры
         if args.start_date or args.end_date or args.geo_id:
